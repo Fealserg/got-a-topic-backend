@@ -8,4 +8,4 @@ COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app alembic.ini ./
 USER app
 EXPOSE 8080
-CMD ["sh", "-c", "alembic upgrade head && python -m app.seed && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
+CMD ["sh", "-c", "alembic upgrade head && python -m app.seed && uvicorn app.main:app --no-access-log --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]

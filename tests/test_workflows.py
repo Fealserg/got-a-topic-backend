@@ -171,3 +171,50 @@ def test_expired_invitation_cannot_be_accepted(account):
         slot=db.get(Slot,1);slot.starts_at=int(time.time())-100;slot.ends_at=int(time.time())+800
     assert b.get('/api/invitations').json()[0]['status']=='expired'
     assert b.post(f'/api/invitations/{iid}/action',json={'action':'accept'}).status_code==409
+
+def test_openapi_success_and_error_contracts_are_explicit(client):
+    schema=client.get('/api/openapi.json').json()
+    for path,methods in schema['paths'].items():
+        for method,operation in methods.items():
+            if method not in ('get','post','put','delete'): continue
+            for code,response in operation['responses'].items():
+                if code in ('200','201'):
+                    assert response['content']['application/json']['schema'],(path,method)
+            assert operation['responses']['500']['content']['application/json']['schema']['$ref'].endswith('/ErrorResponse')
+    assert 'password_hash' not in str(schema['components']['schemas']['PrivateProfile'])
+
+def test_unexpected_error_is_safe_json_and_structured_log(client,caplog,monkeypatch):
+    import app.main as main
+    records=[]
+    monkeypatch.setattr(main.logger,'info',records.append)
+    def broken():raise RuntimeError('sensitive-debug-detail')
+    monkeypatch.setattr(main,'SessionLocal',broken)
+    response=client.get('/api/health?token=secret-query')
+    assert response.status_code==500
+    assert response.headers['content-type'].startswith('application/json')
+    assert response.json()['error']['code']==500
+    assert 'sensitive-debug-detail' not in response.text
+    import json
+    record=json.loads(records[-1])
+    assert record['status']==500 and record['duration_ms']>=0
+    assert record['endpoint']=='/api/health'
+    assert 'secret-query' not in records[-1]
+
+def test_framework_404_also_uses_error_envelope(client):
+    response=client.get('/api/no-such-endpoint')
+    assert response.status_code==404
+    assert response.json()['error']['code']==404
+
+def test_rate_limit_has_retry_after(client):
+    for _ in range(10):client.post('/api/auth/login',json={'username':'unknown','password':'WrongPass123!'})
+    response=client.post('/api/auth/login',json={'username':'unknown','password':'WrongPass123!'})
+    assert response.status_code==429
+    assert 1<=int(response.headers['retry-after'])<=60
+
+def test_cooldown_has_retry_after(account):
+    a,_=account('alice');b,bid=account('bob')
+    iid=invitation(a,bid).json()['id']
+    b.post(f'/api/invitations/{iid}/action',json={'action':'decline'})
+    response=invitation(a,bid,slot=2)
+    assert response.status_code==429
+    assert 1<=int(response.headers['retry-after'])<=3600

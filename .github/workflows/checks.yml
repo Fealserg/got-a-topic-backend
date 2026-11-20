@@ -1,0 +1,42 @@
+name: Backend checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - run: pip install -r requirements.lock
+      - run: python -m pytest tests -q
+      - run: alembic upgrade head && alembic check
+      - name: Verify generated API contract
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from app.main import app
+          assert app.openapi() == json.loads(Path('docs/openapi.json').read_text()), 'Re-export OpenAPI after changing routes'
+          PY
+      - name: Build container
+        run: docker build -t got-a-topic-backend .
+      - name: Verify container startup and persistence across restart
+        run: |
+          docker volume create est-tema-test-db
+          docker run -d --name est-tema-api -p 8080:8080 -v est-tema-test-db:/data -e FRONTEND_URL=http://localhost:3000 got-a-topic-backend
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://localhost:8080/api/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent -c /tmp/est-tema-cookie -H 'Content-Type: application/json' -H 'X-Requested-With: pereryv' --data '{"username":"containercheck","password":"<PASSWORD_10>","name":"Container test"}' http://localhost:8080/api/auth/register > /tmp/est-tema-registration.json
+          docker restart est-tema-api
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://localhost:8080/api/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent -b /tmp/est-tema-cookie http://localhost:8080/api/me | python -c 'import json,sys; assert json.load(sys.stdin)["username"] == "containercheck"'

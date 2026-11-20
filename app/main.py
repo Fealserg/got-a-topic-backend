@@ -1,7 +1,9 @@
 import hashlib
 import hmac
 import os
-import re
+import json
+import logging
+import math
 import secrets
 import time
 from collections import defaultdict, deque
@@ -13,27 +15,37 @@ from fastapi.security import APIKeyHeader
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import delete, or_, select, text
 from sqlalchemy.exc import IntegrityError
 
+from .schemas import (ErrorResponse, HealthResponse, ConfigResponse, PrivateProfile, OkResponse, RecommendationResponse, InvitationCreated, InvitationResponse, InvitationActionResponse, SlotCreated, StatsResponse)
 from .database import SessionLocal
 from .models import Booking, Feedback, Invitation, Session, Slot, Topic, User
 
 csrf_header = APIKeyHeader(name='X-Requested-With', description='Для изменяющих запросов введите pereryv.', auto_error=False)
-app = FastAPI(dependencies=[Security(csrf_header)], title='Перерыв · Networking API', version='1.0.0', docs_url='/api/docs', openapi_url='/api/openapi.json', redoc_url=None)
+ERROR_RESPONSES = {code: {'model': ErrorResponse, 'description': description} for code, description in {401:'Нет действующей сессии',403:'Действие запрещено',404:'Объект не найден',409:'Конфликт состояния',422:'Ошибка валидации',429:'Лимит запросов; Retry-After в секундах',500:'Внутренняя ошибка без технических подробностей'}.items()}
+logger = logging.getLogger('est_tema.requests')
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(handler)
+logger.propagate = False
+app = FastAPI(responses=ERROR_RESPONSES, dependencies=[Security(csrf_header)], title='Есть тема · Networking API', version='1.0.0', docs_url='/api/docs', openapi_url='/api/openapi.json', redoc_url=None)
 origins = [v.strip() for v in os.getenv('FRONTEND_URL', 'http://127.0.0.1:3000,http://localhost:3000').split(',') if v.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=['GET','POST','PUT','DELETE'], allow_headers=['Content-Type','X-Requested-With'])
 COOKIE = 'pereryv_session'
 SECURE = os.getenv('COOKIE_SECURE', 'false').lower() == 'true'
 limits = defaultdict(deque)
 
-def fail(status, message):
-    raise HTTPException(status, message)
+def fail(status, message, headers=None):
+    raise HTTPException(status, message, headers=headers)
 
-@app.exception_handler(HTTPException)
+@app.exception_handler(StarletteHTTPException)
 async def http_error(_, exc):
-    return JSONResponse({'error': {'code': exc.status_code, 'message': exc.detail}}, status_code=exc.status_code)
+    return JSONResponse({'error': {'code': exc.status_code, 'message': exc.detail}}, status_code=exc.status_code, headers=exc.headers)
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(_, exc):
@@ -41,13 +53,29 @@ async def validation_error(_, exc):
 
 @app.middleware('http')
 async def security(request, call_next):
-    if request.method in ('POST','PUT','DELETE','PATCH'):
-        origin = request.headers.get('origin')
-        if (origin and origin not in origins) or request.headers.get('x-requested-with') != 'pereryv':
-            return JSONResponse({'error': {'code': 403, 'message': 'Недопустимый источник запроса.'}}, status_code=403)
-    response = await call_next(request)
+    started = time.perf_counter()
+    response = None
+    try:
+        if request.method in ('POST','PUT','DELETE','PATCH'):
+            origin = request.headers.get('origin')
+            if (origin and origin not in origins) or request.headers.get('x-requested-with') != 'pereryv':
+                response = JSONResponse({'error': {'code': 403, 'message': 'Недопустимый источник запроса.'}}, status_code=403)
+        if response is None:
+            response = await call_next(request)
+    except Exception:
+        # Do not log exception text, request bodies, credentials or personal data.
+        response = JSONResponse({'error': {'code': 500, 'message': 'Внутренняя ошибка сервиса. Попробуйте позже.'}}, status_code=500)
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['Cache-Control'] = 'no-store'
+    route = request.scope.get('route')
+    endpoint = getattr(route, 'path', 'unmatched')
+    size = request.headers.get('content-length', '')
+    logger.info(json.dumps({
+        'time': int(time.time()), 'method': request.method, 'endpoint': endpoint,
+        'status': response.status_code, 'duration_ms': round((time.perf_counter()-started)*1000, 2),
+        'input_bytes': int(size) if size.isdecimal() and len(size) < 16 else None,
+        'error_code': response.status_code if response.status_code >= 400 else None,
+    }, ensure_ascii=False))
     return response
 
 def throttle(request, kind, maximum):
@@ -57,7 +85,7 @@ def throttle(request, kind, maximum):
     while q and q[0] < now - 60:
         q.popleft()
     if len(q) >= maximum:
-        fail(429, 'Слишком много попыток. Подождите минуту.')
+        fail(429, 'Слишком много попыток. Подождите минуту.', {'Retry-After': str(max(1, math.ceil(q[0]+60-now)))})
     q.append(now)
     if len(limits) > 10000:
         for k in list(limits):
@@ -158,26 +186,29 @@ class SlotInput(BaseModel):
     location: str = Field(min_length=1,max_length=150)
     @model_validator(mode='after')
     def duration(self):
+        if not self.location.strip():
+            raise ValueError('Укажите точку встречи')
+        self.location = self.location.strip()
         if self.ends_at-self.starts_at != 900:
             raise ValueError('Слот должен длиться 15 минут')
         if self.starts_at <= time.time():
             raise ValueError('Выберите будущее время')
         return self
 
-@app.get('/api/health', tags=['System'])
+@app.get('/api/health', response_model=HealthResponse, tags=['System'])
 def health():
     with SessionLocal() as db:
         db.execute(text('SELECT 1'))
     return {'status':'ok'}
 
-@app.get('/api/config', tags=['System'])
+@app.get('/api/config', response_model=ConfigResponse, tags=['System'])
 def config():
     with SessionLocal() as db:
         return {'topics':[{'id':t.id,'name':t.name} for t in db.scalars(select(Topic).order_by(Topic.id))],
                 'slots':[{'id':s.id,'starts_at':s.starts_at,'ends_at':s.ends_at,'location':s.location,'is_demo':s.is_demo} for s in db.scalars(select(Slot).order_by(Slot.starts_at))],
                 'demo_enabled':os.getenv('DEMO_MODE','false').lower()=='true'}
 
-@app.post('/api/auth/register', status_code=201, tags=['Auth'])
+@app.post('/api/auth/register', response_model=PrivateProfile, status_code=201, tags=['Auth'])
 def register(body: Register, request: Request, response: Response):
     throttle(request,'register',30)
     if not body.name.strip():
@@ -192,7 +223,7 @@ def register(body: Register, request: Request, response: Response):
     except IntegrityError:
         fail(409,'Этот логин уже занят.')
 
-@app.post('/api/auth/login', tags=['Auth'])
+@app.post('/api/auth/login', response_model=PrivateProfile, tags=['Auth'])
 def login(body: Credentials, request: Request, response: Response):
     throttle(request,'login:'+token_hash(body.username.lower())[:16],10)
     with transaction() as db:
@@ -203,18 +234,18 @@ def login(body: Credentials, request: Request, response: Response):
         set_session(db,user,response)
         return private_user(user)
 
-@app.post('/api/auth/logout', tags=['Auth'])
+@app.post('/api/auth/logout', response_model=OkResponse, tags=['Auth'])
 def logout(request: Request, response: Response):
     with transaction() as db:
         db.execute(delete(Session).where(Session.token_hash==token_hash(request.cookies.get(COOKIE,''))))
     response.delete_cookie(COOKIE,path='/')
     return {'ok':True}
 
-@app.get('/api/me', tags=['Profile'])
+@app.get('/api/me', response_model=PrivateProfile, tags=['Profile'])
 def me(user: Auth):
     return private_user(user)
 
-@app.put('/api/me', tags=['Profile'])
+@app.put('/api/me', response_model=PrivateProfile, tags=['Profile'])
 def update_profile(body: Profile, user: Auth):
     with transaction() as db:
         topics = set(db.scalars(select(Topic.id)))
@@ -227,7 +258,7 @@ def update_profile(body: Profile, user: Auth):
         # Existing accepted meetings remain; visibility only controls discovery.
         return private_user(current)
 
-@app.delete('/api/me', tags=['Profile'])
+@app.delete('/api/me', response_model=OkResponse, tags=['Profile'])
 def delete_profile(user: Auth, response: Response):
     with transaction() as db:
         db.execute(delete(User).where(User.id==user.id))
@@ -243,7 +274,7 @@ def compatible_topics(a,b):
     common = (set(a.wanted+a.offered)&set(b.wanted+b.offered)) - direct - reverse
     return direct,reverse,common
 
-@app.get('/api/recommendations', tags=['Matching'])
+@app.get('/api/recommendations', response_model=list[RecommendationResponse], tags=['Matching'])
 def recommendations(user: Auth):
     if not user.visible:
         return []
@@ -266,7 +297,7 @@ def recommendations(user: Auth):
                 result.append({'user':public_user(other),'score':score,'learn_topics':sorted(direct),'share_topics':sorted(reverse),'common_topics':sorted(common),'slot_ids':slots})
         return sorted(result,key=lambda r:(-r['score'],r['user']['id']))[:30]
 
-@app.post('/api/invitations', status_code=201, tags=['Meetings'])
+@app.post('/api/invitations', response_model=InvitationCreated, status_code=201, tags=['Meetings'])
 def invite(body: InviteInput,user: Auth,request: Request):
     throttle(request,'invite:'+str(user.id),10)
     with transaction() as db:
@@ -286,12 +317,12 @@ def invite(body: InviteInput,user: Auth,request: Request):
             fail(409,'Приглашение на это время уже существует.')
         recent=db.scalar(select(Invitation).where(Invitation.sender_id==user.id,Invitation.recipient_id==other.id,Invitation.created_at>time.time()-3600))
         if recent:
-            fail(429,'Вы уже приглашали этого участника. Повторите через час.')
+            fail(429,'Вы уже приглашали этого участника. Повторите через час.', {'Retry-After': str(max(1, math.ceil(recent.created_at+3600-time.time())))})
         inv=Invitation(sender_id=user.id,recipient_id=other.id,slot_id=slot.id,topic_id=body.topic_id,message=body.message.strip(),created_at=int(time.time()))
         db.add(inv);db.flush()
         return {'id':inv.id,'status':inv.status}
 
-@app.get('/api/invitations', tags=['Meetings'])
+@app.get('/api/invitations', response_model=list[InvitationResponse], tags=['Meetings'])
 def invitations(user: Auth):
     with SessionLocal() as db:
         result=[]
@@ -302,7 +333,7 @@ def invitations(user: Auth):
             result.append({'id':inv.id,'incoming':inv.recipient_id==user.id,'other':public_user(other),'slot_id':inv.slot_id,'topic_id':inv.topic_id,'message':inv.message,'status':status,'feedback':{'happened':feedback.happened,'useful':feedback.useful} if feedback else None})
         return result
 
-@app.post('/api/invitations/{invitation_id}/action', tags=['Meetings'])
+@app.post('/api/invitations/{invitation_id}/action', response_model=InvitationActionResponse, tags=['Meetings'])
 def invitation_action(invitation_id: int,body: Action,user: Auth):
     with transaction() as db:
         inv=db.get(Invitation,invitation_id)
@@ -332,7 +363,7 @@ def invitation_action(invitation_id: int,body: Action,user: Auth):
         inv.status=desired
         return {'status':desired}
 
-@app.put('/api/invitations/{invitation_id}/feedback', tags=['Meetings'])
+@app.put('/api/invitations/{invitation_id}/feedback', response_model=OkResponse, tags=['Meetings'])
 def feedback(invitation_id: int,body: FeedbackInput,user: Auth):
     with transaction() as db:
         inv=db.get(Invitation,invitation_id)
@@ -347,7 +378,7 @@ def feedback(invitation_id: int,body: FeedbackInput,user: Auth):
             row.happened, row.useful=body.happened,body.useful
         return {'ok':True}
 
-@app.post('/api/admin/slots', status_code=201, tags=['Admin'])
+@app.post('/api/admin/slots', response_model=SlotCreated, status_code=201, tags=['Admin'])
 def create_slot(body: SlotInput,user: Auth):
     if not user.is_admin:
         fail(403,'Доступно организатору.')
@@ -357,7 +388,7 @@ def create_slot(body: SlotInput,user: Auth):
         slot=Slot(**body.model_dump());db.add(slot);db.flush()
         return {'id':slot.id}
 
-@app.get('/api/admin/stats', tags=['Admin'])
+@app.get('/api/admin/stats', response_model=StatsResponse, tags=['Admin'])
 def stats(user: Auth):
     if not user.is_admin:
         fail(403,'Доступно организатору.')
