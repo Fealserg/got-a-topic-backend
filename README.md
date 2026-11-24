@@ -49,3 +49,7 @@ CI `.github/workflows/checks.yml` проверяет API, миграции, со
 ## Подтверждённая проверка GitHub Actions
 
 Успешный запуск: https://github.com/Fealserg/got-a-topic-backend/actions/runs/44759178052. Проверенные commit и результаты шагов: `docs/ci-verification.json`. GitHub CI подтвердил контейнерные проверки; для frontend также пройдены браузерные сценарии. Размещение в RelaxDev пока не подтверждено.
+
+## Лицензия
+
+Проект распространяется по лицензии MIT. См. файл [LICENSE](./LICENSE).
